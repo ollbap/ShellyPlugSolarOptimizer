@@ -1,58 +1,90 @@
 /**
- * TIME-STEP LOG READER (mJS Safe)
- * Bypasses KVS.List completely. Generates the expected HH:MM keys 
- * mathematically based on the current time and goes back N steps.
+ * SIMPLIFIED SOLAR LOG READER (TIMER BASED)
  */
 
-print("--- SOLAR OPTIMIZER: RECENT LOGS (LAST 10 HOURS) ---");
+let MAX_LOGS = 20;
+let keysToFetch = [];
+let fetchIndex = 0;
+let fetchTimer = null;
 
-// 1. Generate the expected keys (20 steps of 30 mins = 10 hours)
-let expectedKeys = [];
-let steps = 20;
+function padZero(val) {
+  let str = JSON.stringify(val);
+  return str.length < 2 ? "0" + str : str;
+}
 
-let now = new Date();
-let h = now.getHours();
-// Snap to the nearest past 30-min block (0 or 30)
-let m = now.getMinutes() >= 30 ? 30 : 0;
+function buildKeyList() {
+  let now = new Date();
+  let h = now.getHours();
+  let m = now.getMinutes() >= 30 ? 30 : 0;
 
-for (let i = 0; i < steps; i++) {
-  let hStr = JSON.stringify(h);
-  let mStr = JSON.stringify(m);
-  
-  if (hStr.length < 2) hStr = "0" + hStr;
-  if (mStr.length < 2) mStr = "0" + mStr;
-  
-  let key = "solar_log_" + hStr + mStr;
-  
-  // Store them in reverse order so the array is chronological (oldest to newest)
-  expectedKeys[steps - 1 - i] = key;
-  
-  // Step back 30 minutes
-  m -= 30;
-  if (m < 0) {
-    m = 30;
-    h -= 1;
-    if (h < 0) h = 23;
+  for (let i = 0; i < MAX_LOGS; i++) {
+    let mStr = m === 0 ? "00" : "30";
+    keysToFetch.push("solar_log_" + padZero(h) + mStr);
+    
+    // Math for the next iteration (going backwards)
+    if (m === 30) {
+      m = 0;
+    } else {
+      m = 30;
+      h = h - 1;
+      if (h < 0) h = 23; // Wrap around midnight
+    }
   }
 }
 
-function readNext(keys, index) {
-  if (index >= keys.length) {
-    print("--- END OF LOGS ---");
-    Shelly.call("Script.Stop", { id: Shelly.getCurrentScriptId() });
+function exitScript() {
+  // Stop the interval timer
+  Timer.clear(fetchTimer);
+  print("===================================");
+  print("Finished reading logs. Exiting script.");
+  Shelly.call("Script.Stop", { id: Shelly.getCurrentScriptId() });
+}
+
+function fetchNextKey() {
+  // If we have read all keys, exit cleanly
+  if (fetchIndex >= keysToFetch.length) {
+    exitScript();
     return;
   }
 
-  Shelly.call("KVS.Get", { key: keys[index] }, function(res) {
-    // If the key exists, print it. If not, silently ignore and continue.
-    if (res && res.value) {
-      print(res.value);
+  // Get the exact key for this tick
+  let key = keysToFetch[fetchIndex];
+  fetchIndex++;
+
+  // Fetch from KVS
+  Shelly.call("KVS.Get", { key: key }, function(res, err_code) {
+    if (err_code === 0 && res && res.value) {
+      print("[" + key + "] => " + res.value);
+    } else {
+      print("[" + key + "] => (No data)");
     }
-    
-    // Call next iteration
-    readNext(keys, index + 1);
   });
 }
 
-// 2. Start the recursive fetch
-readNext(expectedKeys, 0);
+function start() {
+  print("===================================");
+  print("Initializing Log Reader...");
+  
+  let now = new Date();
+  let todayKey = "run_" + JSON.stringify(now.getFullYear()) + JSON.stringify(now.getMonth()) + JSON.stringify(now.getDate());
+  
+  // 1. Check if the optimizer ran today
+  Shelly.call("KVS.Get", { key: "solar_last_run_date" }, function(res, err_code) {
+    if (err_code === 0 && res && res.value === todayKey) {
+      print("HEATER STATUS: ON (Already run today)");
+    } else {
+      print("HEATER STATUS: OFF (Not run yet today)");
+    }
+    print("===================================");
+    
+    // 2. Synchronously build the array of 40 keys
+    buildKeyList();
+    
+    // 3. Start reading them slowly (1 request every 400ms)
+    // This entirely avoids recursion and prevents the Shelly from crashing.
+    fetchTimer = Timer.set(400, true, fetchNextKey);
+  });
+}
+
+// Start the process
+start();
